@@ -1,0 +1,61 @@
+name: Send test push notification
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  send-test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install firebase-admin web-push
+
+      - name: Send test push to all subscribed devices
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          VAPID_PUBLIC_KEY: ${{ secrets.VAPID_PUBLIC_KEY }}
+          VAPID_PRIVATE_KEY: ${{ secrets.VAPID_PRIVATE_KEY }}
+        run: |
+          node -e '
+          const admin = require("firebase-admin");
+          const webpush = require("web-push");
+
+          admin.initializeApp({
+            credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+          });
+          const db = admin.firestore();
+
+          webpush.setVapidDetails(
+            "mailto:thefineprinthelp@gmail.com",
+            process.env.VAPID_PUBLIC_KEY,
+            process.env.VAPID_PRIVATE_KEY
+          );
+
+          (async () => {
+            const snap = await db.collection("subscriptions").get();
+            console.log("Found " + snap.docs.length + " subscribed device(s).");
+
+            const payload = JSON.stringify({
+              title: "Test notification",
+              body: "If you see this, real push notifications are working!"
+            });
+
+            for (const d of snap.docs) {
+              const data = d.data();
+              try {
+                await webpush.sendNotification(data.subscription, payload);
+                console.log("Sent OK to device: " + d.id);
+              } catch (err) {
+                console.error("FAILED for device " + d.id + ": " + err.message + " (statusCode: " + err.statusCode + ")");
+              }
+            }
+          })();
+          '
