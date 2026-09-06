@@ -2,8 +2,10 @@
 // Runs on a schedule via GitHub Actions.
 // 1. Checks UK, US, and Germany sources for new laws/regulations
 // 2. Compares against the last-seen IDs (stored in Firestore)
-// 3. For every subscribed device whose topic keywords match a new item,
-//    sends a Web Push notification
+// 3. Generates a short plain-English summary of each new item using
+//    Google's Gemini API (free tier)
+// 4. For every subscribed device whose topic keywords match a new item,
+//    sends a Web Push notification that includes the plain-English summary
 
 const admin = require('firebase-admin');
 const webpush = require('web-push');
@@ -24,7 +26,44 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY
 );
 
+// ---------- Gemini setup ----------
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+// Turn a law/regulation title into a one-sentence plain-English summary.
+// Falls back to the original title if anything goes wrong, so a summary
+// failure never blocks a notification from being sent.
+async function summarize(title) {
+  if (!GEMINI_API_KEY) return null;
+
+  try {
+    const prompt = `Explain in one short, plain-English sentence (max 25 words) what this new law or regulation actually does. No preamble, just the sentence. Title: "${title}"`;
+
+    const res = await fetch(GEMINI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+      }),
+    });
+
+    if (!res.ok) {
+      console.error('Gemini API error:', res.status, await res.text());
+      return null;
+    }
+
+    const data = await res.json();
+    const summary = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    return summary || null;
+  } catch (err) {
+    console.error('Summarize failed:', err.message);
+    return null;
+  }
+}
+
 // ---------- Source fetchers ----------
+// Each returns an array of { id, title, url, country }
+
 async function fetchUK() {
   const res = await fetch('https://www.legislation.gov.uk/all/data.feed?results-count=20');
   const xml = await res.text();
@@ -96,6 +135,13 @@ async function main() {
     return;
   }
 
+  // Generate a plain-English summary for each new item (only new ones,
+  // to keep this fast and free — never re-summarizes repeats)
+  for (const item of newItems) {
+    item.summary = await summarize(item.title);
+    console.log(`Summary for "${item.title.slice(0, 50)}...": ${item.summary || '(none — used title instead)'}`);
+  }
+
   const subsSnap = await db.collection('subscriptions').get();
   const subscribers = subsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
@@ -108,7 +154,7 @@ async function main() {
 
     const payload = JSON.stringify({
       title: `New law: ${item.country}`,
-      body: item.title.slice(0, 120),
+      body: item.summary || item.title.slice(0, 120),
       url: item.url,
     });
 
@@ -143,3 +189,4 @@ main().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });
+
